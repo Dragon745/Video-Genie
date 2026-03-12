@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Created a comprehensive `README.md` with features, installation instructions, technical architecture overview, and project branding.
  
 ## [1.0.0] - 2026-03-12 23:10 +05:30
 ### Changed
