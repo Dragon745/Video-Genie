@@ -4,7 +4,18 @@ import argparse
 import torch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from scripts.utils import setup_threading, parse_srt, save_srt
+from scripts.utils import (
+    setup_threading, parse_srt, save_srt, estimate_model_gb, select_device,
+    get_gpu_compute_capability,
+)
+
+# Approximate parameter counts (in millions) for the NLLB model variants.
+NLLB_PARAMS_M = {
+    "facebook/nllb-200-distilled-600M": 615,
+    "facebook/nllb-200-1.3B": 1370,
+    "facebook/nllb-200-distilled-1.3B": 1370,
+    "facebook/nllb-200-3.3B": 3300,
+}
 
 def detect_language(blocks):
     sample_text = " ".join([b[2] for b in blocks[:5]])
@@ -52,23 +63,59 @@ def translate_srt(srt_file: str, tgt_lang: str, model_name: str = "facebook/nllb
     nllb_src = code_map.get(detected_lang, "eng_Latn")
     nllb_tgt = code_map.get(tgt_lang, "eng_Latn")
 
+    # Decide device: use the GPU only if the model (in float16) fits the 2GB rule.
+    # On the GPU we load in float16 to halve the footprint; on CPU we keep float32.
+    params_m = NLLB_PARAMS_M.get(model_name, 3300)
+    est_fp16_gb = estimate_model_gb(params_m, 2)
+    device = select_device(est_fp16_gb)
+
+    # Cards below compute capability 5.3 have no native fp16 math, so half precision
+    # there is emulated and ends up slower than just running on the CPU.
+    if device == "cuda":
+        cc = get_gpu_compute_capability()
+        if cc is None or cc < (5, 3):
+            print(f"[Auto-Device] GPU compute capability {cc} has no native fp16 support; using CPU.")
+            device = "cpu"
+
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    print(f"[Auto-Device] NLLB '{model_name}' ~ {est_fp16_gb:.2f} GB (fp16) -> {device.upper()}")
+
     tokenizer = AutoTokenizer.from_pretrained(model_name, src_lang=nllb_src)
-    # Force full model ingestion into System RAM rather than streaming from disk cache
+    # Force full model ingestion into RAM rather than streaming from disk cache
     model = AutoModelForSeq2SeqLM.from_pretrained(
         model_name,
         low_cpu_mem_usage=False,
         device_map=None,
-        torch_dtype=torch.float32
+        torch_dtype=dtype
     )
-    
-    # Attempt to compile the model for optimized speeds (Experimental on Windows)
+    try:
+        model = model.to(device)
+    except Exception as e:
+        print(f"[Warning] Could not place model on {device} ({e}). Using CPU float32.")
+        device = "cpu"
+        model = model.float().to("cpu")
+
+    tgt_lang_id = tokenizer.convert_tokens_to_ids(nllb_tgt)
+
+    # Warm-up probe: catch unsupported-GPU errors (e.g. old cards) before the full run.
+    if device == "cuda":
+        try:
+            probe = tokenizer("test", return_tensors="pt").to(device)
+            with torch.no_grad():
+                model.generate(**probe, forced_bos_token_id=tgt_lang_id, max_length=8)
+        except Exception as e:
+            print(f"[Warning] GPU inference failed ({e}). Falling back to CPU float32.")
+            device = "cpu"
+            model = model.float().to("cpu")
+
+    # Attempt to compile the model for optimized speeds (Experimental)
     try:
         print("Attempting to compile the model with Torch.compile (this may take a minute or fail)...")
         model = torch.compile(model)
         print("Model compiled successfully for faster translations!")
     except Exception as e:
         print(f"Skipping torch.compile (Unsupported/Failed on this OS or hardware): {e}")
-    
+
     translated_blocks = []
     print(f"Translating to {tgt_lang}...")
     total_blocks = len(blocks)
@@ -77,8 +124,7 @@ def translate_srt(srt_file: str, tgt_lang: str, model_name: str = "facebook/nllb
         print(f"Progress: [{pct:.1f}%] - Translating line {i+1}/{total_blocks}...", end='\r')
         if text.strip():
             flat_text = text.replace('\n', ' ')
-            inputs = tokenizer(flat_text, return_tensors="pt")
-            tgt_lang_id = tokenizer.convert_tokens_to_ids(nllb_tgt)
+            inputs = tokenizer(flat_text, return_tensors="pt").to(device)
             with torch.no_grad():
                 translated_tokens = model.generate(
                     **inputs, forced_bos_token_id=tgt_lang_id, max_length=400

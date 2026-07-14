@@ -36,6 +36,7 @@ class SubprocessWorker(QThread):
         super().__init__()
         self.script_path = script_path
         self.args_list = args_list
+        self._is_running = True
 
     def run(self):
         import re
@@ -403,29 +404,18 @@ class VideoGenieApp(QMainWindow):
         
         self.combo_model = QComboBox()
         self.combo_model.setStyleSheet(combo_style)
-        self.combo_model.setToolTip("Select Whisper Model Size")
+        self.combo_model.setToolTip("Select Whisper Model Size (bigger = more accurate, slower)")
         self.combo_model.addItems(["base", "small", "medium", "large-v2", "large-v3"])
-        
-        self.combo_device = QComboBox()
-        self.combo_device.setStyleSheet(combo_style)
-        self.combo_device.setToolTip("Select Processing Device")
-        self.combo_device.addItems(["cpu", "cuda"])
+        self.combo_model.setCurrentText("large-v3")
 
         self.combo_whisper_lang = QComboBox()
         self.combo_whisper_lang.setStyleSheet(combo_style)
         self.combo_whisper_lang.setToolTip("Select Source Language")
         self.combo_whisper_lang.addItems(["Auto-Detect", "Arabic", "English", "Hindi", "Urdu", "German"])
-        
-        self.combo_compute = QComboBox()
-        self.combo_compute.setStyleSheet(combo_style)
-        self.combo_compute.setToolTip("Select Compute Precision")
-        self.combo_compute.addItems(["float32", "float16", "int8"])
-        
+
         w_layout.addWidget(self.btn_generate_srt, stretch=3)
         w_layout.addWidget(self.combo_whisper_lang, stretch=2)
-        w_layout.addWidget(self.combo_model, stretch=1)
-        w_layout.addWidget(self.combo_device, stretch=1)
-        w_layout.addWidget(self.combo_compute, stretch=1)
+        w_layout.addWidget(self.combo_model, stretch=2)
         pipe_layout.addLayout(w_layout)
 
         # Advanced Whisper settings row
@@ -442,30 +432,9 @@ class VideoGenieApp(QMainWindow):
         self.chk_vad.setStyleSheet("QCheckBox { color: #111827; font-weight: bold; }")
         self.chk_vad.setToolTip("Remove silent sections organically")
         
-        self.chk_condition = QCheckBox(" Cond. on Prev")
-        self.chk_condition.setChecked(True)
-        self.chk_condition.setStyleSheet("QCheckBox { color: #111827; font-weight: bold; }")
-        self.chk_condition.setToolTip("Helpful for context, turn off if it loops.")
-        
-        self.chk_no_punct = QCheckBox(" No Punct.")
-        self.chk_no_punct.setChecked(False)
-        self.chk_no_punct.setStyleSheet("QCheckBox { color: #111827; font-weight: bold; }")
-        self.chk_no_punct.setToolTip("Force-strip punctuation (.,?!) from final subtitles.")
-        
-        # Beam Size
-        lbl_beam = QLabel("Beam:")
-        lbl_beam.setStyleSheet("color: #111827; font-weight: bold;")
-        self.spin_beam = QSpinBox()
-        self.spin_beam.setRange(1, 15)
-        self.spin_beam.setValue(5)
-        self.spin_beam.setStyleSheet("QSpinBox { border: 1px solid #D1D5DB; border-radius: 4px; padding: 4px; background: white; color: #111827; }")
-
         w_adv_layout.addWidget(self.combo_timestamps)
         w_adv_layout.addWidget(self.chk_vad)
-        w_adv_layout.addWidget(self.chk_condition)
-        w_adv_layout.addWidget(self.chk_no_punct)
-        w_adv_layout.addWidget(lbl_beam)
-        w_adv_layout.addWidget(self.spin_beam)
+        w_adv_layout.addStretch()
         pipe_layout.addLayout(w_adv_layout)
 
         # Prompt Row
@@ -599,7 +568,26 @@ class VideoGenieApp(QMainWindow):
         """)
         self.progress_bar.setValue(0)
         self.progress_bar.hide() # Hidden until active
-        right_panel.addWidget(self.progress_bar)
+
+        # Progress bar sits next to a Stop button so any running task can be cancelled.
+        self.btn_stop = QPushButton("⏹ Stop")
+        self.btn_stop.setStyleSheet("""
+            QPushButton { background-color: #FEF2F2; color: #EF4444; border: 1px solid #FCA5A5;
+                          border-radius: 6px; padding: 6px 14px; font-weight: 600; }
+            QPushButton:hover { background-color: #FEE2E2; }
+            QPushButton:disabled { background-color: #F3F4F6; color: #9CA3AF; border: 1px solid #E5E7EB; }
+        """)
+        self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_stop.setToolTip("Cancel the running task")
+        self.btn_stop.clicked.connect(self.stop_task)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.hide()
+
+        progress_row = QHBoxLayout()
+        progress_row.setSpacing(8)
+        progress_row.addWidget(self.progress_bar, stretch=1)
+        progress_row.addWidget(self.btn_stop)
+        right_panel.addLayout(progress_row)
 
         # Assemble Top layout (2-Panel Width Proportions)
         top_layout.addLayout(left_panel, stretch=2)
@@ -629,12 +617,39 @@ class VideoGenieApp(QMainWindow):
         self.btn_translate.setEnabled(enabled)
         self.btn_transliterate.setEnabled(enabled)
         
+        # The Stop button is the inverse: only usable while a task is running.
+        if hasattr(self, 'btn_stop'):
+            self.btn_stop.setEnabled(not enabled)
+            self.btn_stop.setVisible(not enabled)
+
         if enabled:
             self.progress_bar.hide()
             self.progress_bar.setValue(0)
         else:
             self.progress_bar.show()
             self.progress_bar.setRange(0, 0) # Indeterminate spinning
+
+    def stop_task(self):
+        """Kill the running subprocess tree and reset the UI back to idle."""
+        if not (hasattr(self, 'worker') and self.worker and self.worker.isRunning()):
+            return
+
+        self.btn_stop.setEnabled(False)
+        self.log("\n⏹ Stopping task... terminating subprocess.")
+        QApplication.processEvents()  # let the log paint before we block on wait()
+
+        try:
+            self.worker.stop()
+        except Exception as e:
+            self.log(f"[Warning] Error while stopping: {e}")
+
+        # worker.stop() suppresses finished_signal, so reset the UI ourselves.
+        self.set_buttons_enabled(True)
+        self.update_stats()
+        self.progress_bar.hide()
+        self.progress_bar.setRange(0, 100)
+        self.statusBar().showMessage("Ready")
+        self.log("--- Task cancelled by user. ---")
 
     def import_video(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Video to Import", "", "Video Files (*.mp4 *.mkv *.avi *.mov)")
@@ -868,9 +883,7 @@ class VideoGenieApp(QMainWindow):
             
         video_path = os.path.join(self.cwd, self.selected_video)
         model = self.combo_model.currentText()
-        device = self.combo_device.currentText()
-        compute = self.combo_compute.currentText()
-        
+
         lang_selection = self.combo_whisper_lang.currentText()
         lang_map = {
             "Auto-Detect": "auto",
@@ -882,21 +895,15 @@ class VideoGenieApp(QMainWindow):
         }
         iso_lang = lang_map.get(lang_selection, "auto")
         
-        args = [video_path, "--model", model, "--device", device, "--language", iso_lang, "--compute_type", compute]
-        
+        # Device and compute precision are resolved automatically by whisper_script.
+        args = [video_path, "--model", model, "--language", iso_lang]
+
         if self.combo_timestamps.currentText() == "Word-Level":
             args.append("--word_timestamps")
-            
+
         if not self.chk_vad.isChecked():
             args.append("--no_vad")
-            
-        if not self.chk_condition.isChecked():
-            args.append("--no_condition")
-            
-        if self.chk_no_punct.isChecked():
-            args.append("--no_punctuation")
-            
-        args.extend(["--beam_size", str(self.spin_beam.value())])
+
         args.extend(["--vad_min_silence_ms", str(self.slider_vad.value())])
             
         opt_prompt = self.line_prompt.text().strip()

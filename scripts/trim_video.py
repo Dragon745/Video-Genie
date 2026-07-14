@@ -1,4 +1,5 @@
 import os
+import sys
 import subprocess
 import time
 
@@ -187,8 +188,38 @@ def main():
 
     trim_video(input_file, front_trim_sec, last_trim_sec)
 
+def run_exact_cli(argv):
+    """
+    Non-interactive entry point used by the GUI subprocess.
+    Usage: trim_video.py exact <video_path> <start_sec> <end_sec>
+    """
+    if len(argv) != 3:
+        print("Usage: trim_video.py exact <video_path> <start_sec> <end_sec>")
+        sys.exit(2)
+
+    video_path = argv[0]
+    try:
+        start_sec = float(argv[1])
+        end_sec = float(argv[2])
+    except ValueError:
+        print("Error: start and end times must be numeric (seconds).")
+        sys.exit(2)
+
+    print(f"Trimming '{video_path}' to {start_sec:.2f}s -> {end_sec:.2f}s...")
+    success = trim_video_exact(video_path, start_sec, end_sec)
+    if success:
+        print("✅ Trim completed successfully.")
+        sys.exit(0)
+    else:
+        print("❌ Trim failed.")
+        sys.exit(1)
+
 if __name__ == "__main__":
     try:
-        main()
+        # The GUI invokes: trim_video.py exact <video> <start> <end>
+        if len(sys.argv) > 1 and sys.argv[1] == "exact":
+            run_exact_cli(sys.argv[2:])
+        else:
+            main()
     except KeyboardInterrupt:
         print("\nProcess interrupted by user.")

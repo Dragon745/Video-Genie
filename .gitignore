@@ -181,3 +181,46 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# ---------------------------------------------------------------
+# Media files — source videos and extracted audio.
+# These are large (a single lecture is ~450MB) and GitHub rejects
+# anything over 100MB, so they must never be committed.
+# ---------------------------------------------------------------
+
+# Video
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wmv
+*.flv
+*.webm
+*.m4v
+*.mpg
+*.mpeg
+*.mts
+*.m2ts
+*.3gp
+*.ts
+*.vob
+*.ogv
+
+# Audio
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+*.ogg
+*.oga
+*.opus
+*.wma
+*.aiff
+*.aif
+*.amr
+
+# Interrupted transcription artifacts
+*.partial
+
+# Transient OpenAI batch job state
+data/batch_state.json

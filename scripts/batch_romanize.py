@@ -4,8 +4,9 @@ import time
 from openai import OpenAI
 
 # ---------------- CONFIGURATION ----------------
-DATA_DIR = r"d:\GitHub\Video Genie\data"
-SECRET_FILE = r"d:\GitHub\Video Genie\secret\openai_api_key.json"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+SECRET_FILE = os.path.join(PROJECT_ROOT, "secret", "openai_api_key.json")
 WORDS_FILE = os.path.join(DATA_DIR, "words.txt")
 DICT_FILE = os.path.join(DATA_DIR, "urdu_roman_dict.json")
 STATE_FILE = os.path.join(DATA_DIR, "batch_state.json")
