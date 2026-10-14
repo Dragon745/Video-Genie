@@ -17,14 +17,50 @@ NLLB_PARAMS_M = {
     "facebook/nllb-200-3.3B": 3300,
 }
 
+# Languages this pipeline supports, mapped to their NLLB codes.
+NLLB_CODE_MAP = {
+    "ur": "urd_Arab",   # Urdu
+    "hi": "hin_Deva",   # Hindi
+    "en": "eng_Latn",   # English
+    "ar": "arb_Arab",   # Arabic
+}
+
 def detect_language(blocks):
-    sample_text = " ".join([b[2] for b in blocks[:5]])
+    """Detect the dominant language of an SRT by majority vote across all lines.
+
+    The old version sampled only the first few blocks, which in a religious lecture
+    are the Arabic opening (bismillah etc.) - so an otherwise Urdu file was labelled
+    Arabic. Voting over the whole file lets the true majority language win, and any
+    language outside NLLB_CODE_MAP is folded into the closest supported one.
+    """
     try:
-        from langdetect import detect
-        detected_lang = detect(sample_text)
-    except Exception as e:
-        detected_lang = "ur"
-    return detected_lang
+        from langdetect import detect, DetectorFactory
+        DetectorFactory.seed = 0  # deterministic results across runs
+    except Exception:
+        return "ur"
+
+    from collections import Counter
+    votes = Counter()
+    for _idx, _ts, text in blocks:
+        text = text.strip()
+        if len(text) < 4:
+            continue  # too short to classify reliably
+        try:
+            lang = detect(text)
+        except Exception:
+            continue
+        # Fold unsupported detections onto a supported neighbour rather than dropping
+        # to English: Persian/Arabic-script variants are, for our purposes, Urdu/Arabic.
+        if lang not in NLLB_CODE_MAP:
+            lang = {"fa": "ur", "ps": "ur", "ckb": "ar"}.get(lang, lang)
+        if lang in NLLB_CODE_MAP:
+            votes[lang] += 1
+
+    if not votes:
+        return "ur"
+    winner, _count = votes.most_common(1)[0]
+    print(f"  Language vote across {sum(votes.values())} lines: {dict(votes)}")
+    return winner
 
 def translate_srt(srt_file: str, tgt_lang: str, model_name: str = "facebook/nllb-200-3.3B") -> tuple[str, str, list]:
     """
@@ -59,9 +95,9 @@ def translate_srt(srt_file: str, tgt_lang: str, model_name: str = "facebook/nllb
         print("Please perform: pip install transformers torch sentencepiece")
         sys.exit(1)
 
-    code_map = {"ur": "urd_Arab", "hi": "hin_Deva", "en": "eng_Latn"}
-    nllb_src = code_map.get(detected_lang, "eng_Latn")
-    nllb_tgt = code_map.get(tgt_lang, "eng_Latn")
+    nllb_src = NLLB_CODE_MAP.get(detected_lang, "urd_Arab")
+    nllb_tgt = NLLB_CODE_MAP.get(tgt_lang, "eng_Latn")
+    print(f"Translating {nllb_src} -> {nllb_tgt}")
 
     # Decide device: use the GPU only if the model (in float16) fits the 2GB rule.
     # On the GPU we load in float16 to halve the footprint; on CPU we keep float32.
@@ -86,7 +122,11 @@ def translate_srt(srt_file: str, tgt_lang: str, model_name: str = "facebook/nllb
         model_name,
         low_cpu_mem_usage=False,
         device_map=None,
-        torch_dtype=dtype
+        torch_dtype=dtype,
+        # Force the safetensors weights. Newer transformers refuses the .bin path
+        # (torch.load) unless torch >= 2.6 (CVE-2025-32434); safetensors is both safe
+        # and the file every NLLB variant on the Hub already ships.
+        use_safetensors=True,
     )
     try:
         model = model.to(device)

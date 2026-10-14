@@ -224,3 +224,9 @@ cython_debug/
 
 # Transient OpenAI batch job state
 data/batch_state.json
+
+# Generated pipeline output (SRTs, romanized files, etc.)
+working/
+
+# Old project copy (contains hardcoded secrets — keep out of git)
+Old_shorts/

@@ -2,16 +2,30 @@ import sys
 import os
 import time
 import shutil
+
+# Qt6's video player (QVideoWidget) hangs the UI on native Wayland, which freezes the
+# app when the Visual Trimmer opens. Running under XWayland (the "xcb" platform) avoids
+# it. Only switch if xcb's runtime dep is actually present, otherwise forcing it would
+# stop the app from launching at all. Must run before any PyQt6 import.
+if sys.platform.startswith("linux") and os.environ.get("QT_QPA_PLATFORM") is None:
+    if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        import ctypes
+        try:
+            ctypes.CDLL("libxcb-cursor.so.0")
+            os.environ["QT_QPA_PLATFORM"] = "xcb"
+        except OSError:
+            # libxcb-cursor0 not installed; stay on Wayland so the app still starts.
+            # (Install it with: sudo apt install libxcb-cursor0)
+            pass
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QListWidget, QLabel, QPushButton, QLineEdit, QGroupBox, 
     QFormLayout, QMessageBox, QComboBox, QTextEdit, QProgressBar,
     QDialog, QSlider, QStyle, QFileDialog, QFrame, QCheckBox, QSpinBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl
-from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PyQt6.QtMultimediaWidgets import QVideoWidget
-from PyQt6.QtGui import QFont, QIcon, QColor, QPalette
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QFont, QIcon, QColor, QPalette, QPixmap
 
 # Import our modular scripts
 from scripts.whisper_script import generate_srt
@@ -105,55 +119,138 @@ class SubprocessWorker(QThread):
         self.terminate()
         self.wait()
 
+class FramePreviewWorker(QThread):
+    """Extracts a single video frame at a timestamp via ffmpeg, off the UI thread.
+
+    Qt6's QMediaPlayer hangs the UI when loading large videos (especially on Wayland),
+    so the trimmer previews frames with ffmpeg instead of live playback. Each seek runs
+    in this worker so the window never freezes while a frame is being pulled.
+    """
+    frame_ready = pyqtSignal(int, bytes)  # (position_ms, jpeg_bytes)
+
+    def __init__(self, video_path):
+        super().__init__()
+        self.video_path = video_path
+        self._pending_ms = None
+        self._current_ms = None
+        self._alive = True
+        self._lock = __import__("threading").Lock()
+        self._wake = __import__("threading").Event()
+
+    def request(self, position_ms):
+        """Ask for a frame; if a newer request arrives mid-extraction, the old one is dropped."""
+        with self._lock:
+            self._pending_ms = position_ms
+        self._wake.set()
+
+    def run(self):
+        while self._alive:
+            self._wake.wait()
+            self._wake.clear()
+            while True:
+                with self._lock:
+                    ms = self._pending_ms
+                    self._pending_ms = None
+                if ms is None or not self._alive:
+                    break
+                self._current_ms = ms
+                data = self._extract(ms)
+                if data is not None and self._alive:
+                    self.frame_ready.emit(ms, data)
+
+    def _extract(self, position_ms):
+        cmd = [
+            "ffmpeg", "-nostdin", "-ss", str(position_ms / 1000.0), "-i", self.video_path,
+            "-frames:v", "1", "-q:v", "5", "-vf", "scale=640:-2",
+            "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+        ]
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15)
+            return proc.stdout or None
+        except Exception:
+            return None
+
+    def stop(self):
+        self._alive = False
+        self._wake.set()
+        self.wait()
+
+
 class VisualTrimmerDialog(QDialog):
     def __init__(self, video_path, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Visual Video Trimmer")
-        self.setGeometry(150, 150, 800, 600)
+        self.setGeometry(150, 150, 800, 620)
         self.video_path = video_path
-        
+
         self.in_point_ms = 0
         self.out_point_ms = 0
-        self.duration_ms = 0
-        
+        # Duration comes from ffprobe (seconds); the slider works in milliseconds.
+        dur_sec = get_video_duration(video_path) or 0
+        self.duration_ms = int(dur_sec * 1000)
+        self.out_point_ms = self.duration_ms
+
+        self.worker = FramePreviewWorker(video_path)
+        self.worker.frame_ready.connect(self.on_frame_ready)
+        self.worker.start()
+
+        # Debounce so dragging the slider doesn't queue an ffmpeg call per pixel.
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(90)
+        self.preview_timer.timeout.connect(self.request_preview)
+
         self.init_ui()
-        self.load_video()
+        self.slider.setRange(0, self.duration_ms)
+        self.lbl_out.setText(f"Out: {self.duration_ms/1000:.1f}s")
+        self.update_time_label()
+        self.request_preview()  # show the first frame
 
     def init_ui(self):
         layout = QVBoxLayout(self)
 
-        # Video Player Area
-        self.video_widget = QVideoWidget()
-        layout.addWidget(self.video_widget, stretch=1)
+        # Frame preview area (a QLabel holding an ffmpeg-extracted still)
+        self.frame_label = QLabel("Loading preview...")
+        self.frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.frame_label.setStyleSheet("background-color: #000000; color: #9CA3AF; border-radius: 6px;")
+        self.frame_label.setMinimumHeight(340)
+        layout.addWidget(self.frame_label, stretch=1)
 
-        # Controls Area
+        # Scrub bar
         control_layout = QHBoxLayout()
-        
-        self.btn_play = QPushButton()
-        self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        self.btn_play.clicked.connect(self.toggle_play)
-        
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 0)
-        self.slider.sliderMoved.connect(self.set_position)
-        
+        self.slider.valueChanged.connect(self.on_slider_changed)
         self.lbl_time = QLabel("00:00:00 / 00:00:00")
-        
-        control_layout.addWidget(self.btn_play)
         control_layout.addWidget(self.slider)
         control_layout.addWidget(self.lbl_time)
         layout.addLayout(control_layout)
 
+        # Nudge buttons for frame-accurate positioning
+        nudge_layout = QHBoxLayout()
+        for label, delta in [("⏮ -10s", -10000), ("◀ -1s", -1000), ("+1s ▶", 1000), ("+10s ⏭", 10000)]:
+            b = QPushButton(label)
+            b.clicked.connect(lambda _c, d=delta: self.nudge(d))
+            nudge_layout.addWidget(b)
+
+        # Open the real system player (with audio) starting at the current scrub position.
+        nudge_layout.addStretch()
+        self.btn_play_ext = QPushButton("▶ Watch from here")
+        self.btn_play_ext.setToolTip("Opens the video in your system player, with sound, "
+                                     "starting at the current position.")
+        self.btn_play_ext.setStyleSheet("font-weight: 600; padding: 4px 12px;")
+        self.btn_play_ext.clicked.connect(self.play_external)
+        nudge_layout.addWidget(self.btn_play_ext)
+        layout.addLayout(nudge_layout)
+
         # Trimming Points
         trim_layout = QHBoxLayout()
-        self.btn_set_in = QPushButton("Set In Point [ { ]")
-        self.btn_set_out = QPushButton("Set Out Point [ } ]")
+        self.btn_set_in = QPushButton("Set In Point")
+        self.btn_set_out = QPushButton("Set Out Point")
         self.lbl_in = QLabel("In: 0.0s")
         self.lbl_out = QLabel("Out: End")
-        
         self.btn_set_in.clicked.connect(self.set_in_point)
         self.btn_set_out.clicked.connect(self.set_out_point)
-        
         trim_layout.addWidget(self.btn_set_in)
         trim_layout.addWidget(self.lbl_in)
         trim_layout.addWidget(self.btn_set_out)
@@ -165,62 +262,74 @@ class VisualTrimmerDialog(QDialog):
         self.btn_apply = QPushButton("Trim & Replace Video")
         self.btn_apply.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold;")
         self.btn_cancel = QPushButton("Cancel")
-        
         self.btn_apply.clicked.connect(self.accept)
         self.btn_cancel.clicked.connect(self.reject)
-        
         action_layout.addStretch()
         action_layout.addWidget(self.btn_cancel)
         action_layout.addWidget(self.btn_apply)
         layout.addLayout(action_layout)
 
-        # MediaPlayer Setup
-        self.media_player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
-        self.media_player.setAudioOutput(self.audio_output)
-        self.media_player.setVideoOutput(self.video_widget)
-        
-        self.media_player.positionChanged.connect(self.position_changed)
-        self.media_player.durationChanged.connect(self.duration_changed)
+    def on_slider_changed(self, _value):
+        self.update_time_label()
+        self.preview_timer.start()  # debounced; fires 90ms after the last move
 
-    def load_video(self):
-        self.media_player.setSource(QUrl.fromLocalFile(self.video_path))
-        self.media_player.play()
-        self.media_player.pause()
+    def nudge(self, delta_ms):
+        self.slider.setValue(max(0, min(self.duration_ms, self.slider.value() + delta_ms)))
 
-    def toggle_play(self):
-        if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.media_player.pause()
-            self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+    def play_external(self):
+        """Launch the video in the system's real player, seeking to the current position.
+
+        Runs detached so it never blocks this app. Prefers a player that supports a
+        start-time flag; otherwise opens the default player from the beginning.
+        """
+        pos = self.slider.value() / 1000.0
+
+        # Launch external apps with a clean environment. This app forces
+        # QT_QPA_PLATFORM=xcb for its own use, but VLC (also a Qt app) inherits our
+        # env via Popen, and that override breaks its native file dialogs. Drop the
+        # Qt platform overrides so the player runs with the system defaults.
+        env = os.environ.copy()
+        for var in ("QT_QPA_PLATFORM", "QT_QPA_PLATFORM_PLUGIN_PATH"):
+            env.pop(var, None)
+
+        seek_players = [
+            (["vlc", "--start-time", str(pos), self.video_path]),
+            (["mpv", f"--start={pos}", self.video_path]),
+            (["ffplay", "-ss", str(pos), "-autoexit", self.video_path]),
+        ]
+        for cmd in seek_players:
+            if shutil.which(cmd[0]):
+                subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+        # No seek-capable player found: fall back to the default handler (no seek).
+        opener = shutil.which("xdg-open") or shutil.which("open")
+        if opener:
+            subprocess.Popen([opener, self.video_path], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
-            self.media_player.play()
-            self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+            QMessageBox.warning(self, "No Player", "No external video player was found.")
 
-    def position_changed(self, position):
-        self.slider.setValue(position)
-        self.update_time_label()
+    def request_preview(self):
+        self.worker.request(self.slider.value())
 
-    def duration_changed(self, duration):
-        self.slider.setRange(0, duration)
-        self.duration_ms = duration
-        self.out_point_ms = duration
-        self.update_time_label()
-        self.lbl_out.setText(f"Out: {duration/1000:.1f}s")
-
-    def set_position(self, position):
-        self.media_player.setPosition(position)
+    def on_frame_ready(self, _position_ms, jpeg_bytes):
+        pix = QPixmap()
+        if pix.loadFromData(jpeg_bytes, "JPG"):
+            self.frame_label.setPixmap(pix.scaled(
+                self.frame_label.width(), self.frame_label.height(),
+                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
     def update_time_label(self):
-        pos_s = self.media_player.position() // 1000
+        pos_s = self.slider.value() // 1000
         dur_s = self.duration_ms // 1000
-        self.lbl_time.setText(f"{pos_s//3600:02d}:{(pos_s%3600)//60:02d}:{pos_s%60:02d} / {dur_s//3600:02d}:{(dur_s%3600)//60:02d}:{dur_s%60:02d}")
+        self.lbl_time.setText(f"{pos_s//3600:02d}:{(pos_s%3600)//60:02d}:{pos_s%60:02d} / "
+                              f"{dur_s//3600:02d}:{(dur_s%3600)//60:02d}:{dur_s%60:02d}")
 
     def set_in_point(self):
-        self.in_point_ms = self.media_player.position()
+        self.in_point_ms = self.slider.value()
         self.lbl_in.setText(f"In: {self.in_point_ms/1000:.1f}s")
 
     def set_out_point(self):
-        self.out_point_ms = self.media_player.position()
+        self.out_point_ms = self.slider.value()
         self.lbl_out.setText(f"Out: {self.out_point_ms/1000:.1f}s")
 
     def get_trim_points_sec(self):
@@ -228,9 +337,7 @@ class VisualTrimmerDialog(QDialog):
         return self.in_point_ms / 1000.0, self.out_point_ms / 1000.0
 
     def closeEvent(self, event):
-        if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.media_player.pause()
-        self.media_player.setSource(QUrl()) # Free the video file handle
+        self.worker.stop()
         super().closeEvent(event)
 
 
@@ -431,9 +538,16 @@ class VideoGenieApp(QMainWindow):
         self.chk_vad.setChecked(True)
         self.chk_vad.setStyleSheet("QCheckBox { color: #111827; font-weight: bold; }")
         self.chk_vad.setToolTip("Remove silent sections organically")
-        
+
+        self.chk_condition = QCheckBox(" Cond. on Prev")
+        self.chk_condition.setChecked(True)
+        self.chk_condition.setStyleSheet("QCheckBox { color: #111827; font-weight: bold; }")
+        self.chk_condition.setToolTip("Feeds previous text as context. Helpful for coherence, "
+                                      "but turn OFF if subtitles loop or timestamps drift on long files.")
+
         w_adv_layout.addWidget(self.combo_timestamps)
         w_adv_layout.addWidget(self.chk_vad)
+        w_adv_layout.addWidget(self.chk_condition)
         w_adv_layout.addStretch()
         pipe_layout.addLayout(w_adv_layout)
 
@@ -903,6 +1017,9 @@ class VideoGenieApp(QMainWindow):
 
         if not self.chk_vad.isChecked():
             args.append("--no_vad")
+
+        if not self.chk_condition.isChecked():
+            args.append("--no_condition")
 
         args.extend(["--vad_min_silence_ms", str(self.slider_vad.value())])
             

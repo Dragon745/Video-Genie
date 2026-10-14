@@ -65,12 +65,17 @@ def _gpu_can_run(model_size, compute_type):
     est_gb = estimate_model_gb(params_m, WHISPER_BYTES_PER_PARAM.get(compute_type, 4))
     return select_device(est_gb) == "cuda"
 
+# Compute type used when falling back to the CPU. float32 is full precision and
+# matches the original Windows behaviour; int8 is faster but quantized (lower
+# precision), which can degrade timestamp accuracy on long non-English audio.
+CPU_COMPUTE_TYPE = "float32"
+
 def resolve_device_and_compute(device, model_size, compute_type):
     """Resolve device/compute_type 'auto' into concrete values for this machine.
 
     Prefers the GPU when the card supports a compute type *and* the model fits the
-    VRAM budget; otherwise falls back to CPU with int8, which is by far the fastest
-    CPU path and costs almost no accuracy compared to float32.
+    VRAM budget; otherwise falls back to the CPU using float32 for maximum accuracy.
+    (Pass --compute_type int8 explicitly to trade precision for ~2-4x more speed.)
     """
     if compute_type == "auto":
         if device in ("auto", "cuda"):
@@ -89,15 +94,15 @@ def resolve_device_and_compute(device, model_size, compute_type):
                       f"{CT2_MIN_CUDA_COMPUTE_CAPABILITY[0]}.{CT2_MIN_CUDA_COMPUTE_CAPABILITY[1]}")
         else:
             reason = f"'{model_size}' does not fit the GPU VRAM budget"
-        print(f"[Auto] Whisper '{model_size}' -> CPU / int8 ({reason}).")
-        return "cpu", "int8"
+        print(f"[Auto] Whisper '{model_size}' -> CPU / {CPU_COMPUTE_TYPE} ({reason}).")
+        return "cpu", CPU_COMPUTE_TYPE
 
     # An explicit compute type was requested.
     if device == "auto":
         device = "cuda" if _gpu_can_run(model_size, compute_type) else "cpu"
     if device == "cpu" and compute_type == "float16":
-        print("[Note] float16 is not supported on CPU; using int8 instead.")
-        compute_type = "int8"
+        print(f"[Note] float16 is not supported on CPU; using {CPU_COMPUTE_TYPE} instead.")
+        compute_type = CPU_COMPUTE_TYPE
     print(f"[Auto] Whisper '{model_size}' @ {compute_type} -> {device.upper()}")
     return device, compute_type
 
@@ -186,7 +191,7 @@ def generate_srt(video_file: str, model_size: str = "base", device: str = "auto"
         except Exception as e:
             # If the GPU path fails (missing CUDA libs, unsupported card, OOM), fall back to CPU.
             if device == "cuda":
-                cpu_compute = "int8" if compute_type == "float16" else compute_type
+                cpu_compute = CPU_COMPUTE_TYPE if compute_type == "float16" else compute_type
                 print(f"[Warning] GPU load failed ({e}).")
                 print(f"Falling back to CPU with compute type '{cpu_compute}'...")
                 device = "cpu"
@@ -227,7 +232,7 @@ def generate_srt(video_file: str, model_size: str = "base", device: str = "auto"
                 print(f"\n[Warning] GPU inference failed ({e}).")
                 print("Reloading the model on CPU with int8 and retrying...")
                 try:
-                    model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=7)
+                    model = WhisperModel(model_size, device="cpu", compute_type=CPU_COMPUTE_TYPE, cpu_threads=7)
                     _write_segments_to_srt(model, video_file, tmp_file, transcribe_kwargs,
                                            word_timestamps, no_punctuation)
                 except Exception as e2:

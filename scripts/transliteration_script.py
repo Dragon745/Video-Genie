@@ -1,7 +1,6 @@
 import os
 import json
 import re
-import unicodedata
 from openai import OpenAI
 
 # ---------------- CONFIGURATION ----------------
@@ -78,12 +77,6 @@ def load_dict():
 def save_dict(dictionary):
     with open(DICT_FILE, 'w', encoding='utf-8') as f:
         json.dump(dictionary, f, ensure_ascii=False, indent=2)
-
-def clean_word(word):
-    # Remove punctuation for dictionary lookup, but keep it for output
-    # IMPORTANT: Do not strip specific Islamic unicode ligatures so they can be explicitly translated
-    cleaned = re.sub(r'[^\w\sﷺﷻؓ]', '', word).strip()
-    return cleaned
 
 def group_by_context(missing_words):
     """Invert {word: sentence} into [{"context": sentence, "words": [...]}, ...].
@@ -266,17 +259,18 @@ def process_srt(input_path, output_path):
             
         words = stripped.split()
         for word in words:
-            cleaned = clean_word(word)
-            if not cleaned:
+            # Use the raw token as the dictionary key. Nothing is stripped, so words
+            # that differ only by diacritics (e.g. "billah" vs "billahi") stay distinct.
+            if not word:
                 continue
-            cached = urdu_dict.get(cleaned)
+            cached = urdu_dict.get(word)
             # Re-request words that are absent, and also ones a previous run cached
             # while still in the original script (e.g. "خربان" -> "khurbaان"), so the
             # dictionary heals itself instead of serving bad entries forever.
             if cached is None or looks_untransliterated(cached):
                 # Store the word and the sentence it lived in for context!
-                if cleaned not in missing_words:
-                    missing_words[cleaned] = stripped
+                if word not in missing_words:
+                    missing_words[word] = stripped
                     
     # --- BULK TRANSLATE MISSING WORDS ---
     if missing_words:
@@ -312,20 +306,12 @@ def process_srt(input_path, output_path):
                 roman_words = []
                 
                 for word in words:
-                    cleaned = clean_word(word)
-                    
-                    if not cleaned:
-                        roman_words.append(word)
-                        continue
-                        
-                    if cleaned in urdu_dict:
-                        # Re-attach any punctuation that was originally attached to the word
-                        roman_word = str(urdu_dict[cleaned])
-                        final_word = word.replace(cleaned, roman_word)
-                        roman_words.append(final_word)
+                    # Look up the raw token directly and output its roman value.
+                    roman = urdu_dict.get(word)
+                    if roman and not looks_untransliterated(str(roman)):
+                        roman_words.append(str(roman))
                     else:
-                        # Even after OpenAI bulk retry, it failed to translate this specific word.
-                        # Leave it as original Urdu rather than crashing the sentence.
+                        # Not in the dictionary (or a bad entry): keep the original token.
                         roman_words.append(word)
                         
                 # Reconstruct the line
